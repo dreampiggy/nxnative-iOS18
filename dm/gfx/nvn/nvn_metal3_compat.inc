@@ -11,7 +11,9 @@
 
 static NSRecursiveLock *nx3_registry_lock;
 static NSHashTable *nx3_resources;
-static NSMapTable *nx3_ids;
+// GPU resource IDs are typed handles: a texture and a sampler can have the
+// same numeric ID while both are alive. Never resolve them through one map.
+static NSMapTable *nx3_texture_ids, *nx3_sampler_ids;
 @interface NX3BufferRange : NSObject
 @property(weak) id<MTLBuffer> buffer;
 @property uint64_t lo, hi;
@@ -28,7 +30,7 @@ static _Atomic uint64_t nx3_lookups, nx3_binding_sets, nx3_binding_skips, nx3_de
 static void nx3_register(id object) {
     if (!object) return;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ nx3_registry_lock = [NSRecursiveLock new]; nx3_resources = [NSHashTable weakObjectsHashTable]; nx3_ids = [NSMapTable strongToWeakObjectsMapTable]; nx3_buffer_ranges = [NSMutableArray array]; });
+    dispatch_once(&once, ^{ nx3_registry_lock = [NSRecursiveLock new]; nx3_resources = [NSHashTable weakObjectsHashTable]; nx3_texture_ids = [NSMapTable strongToWeakObjectsMapTable]; nx3_sampler_ids = [NSMapTable strongToWeakObjectsMapTable]; nx3_buffer_ranges = [NSMutableArray array]; });
     [nx3_registry_lock lock];
     // A view has its own descriptor ID but shares residency/hazards with its
     // underlying allocation (the same parent/buffer walk as res_check).
@@ -55,9 +57,11 @@ static void nx3_register(id object) {
         }
         atomic_fetch_add_explicit(&nx3_resource_generation, 1, memory_order_release);
     }
-    if ([object respondsToSelector:@selector(gpuResourceID)]) {
+    NSMapTable *ids = [object conformsToProtocol:@protocol(MTLTexture)] ? nx3_texture_ids :
+        [object conformsToProtocol:@protocol(MTLSamplerState)] ? nx3_sampler_ids : nil;
+    if (ids) {
         MTLResourceID rid = [(id<MTLTexture>)object gpuResourceID];
-        if (rid._impl) [nx3_ids setObject:object forKey:@(rid._impl)];
+        if (rid._impl) [ids setObject:object forKey:@(rid._impl)];
     }
     [nx3_registry_lock unlock];
 }
@@ -81,9 +85,9 @@ static NSArray *nx3_snapshot(NX3ResourceSnapshot *snapshot) {
 // Views and buffer-backed textures are made on MTLTexture/MTLBuffer, bypassing
 // NX3Device. Register every returned texture before a table consumes its ID.
 static id<MTLTexture> nx3_track_texture(id<MTLTexture> texture) { nx3_register(texture); return texture; }
-static id nx3_id(uint64_t value) {
-    [nx3_registry_lock lock]; id object = [nx3_ids objectForKey:@(value)]; [nx3_registry_lock unlock];
-    if (value && !object) { fprintf(stderr, "[RED] Metal3 unresolved resource ID 0x%llx\n", (unsigned long long)value); abort(); }
+static id nx3_id(uint64_t value, BOOL sampler) {
+    [nx3_registry_lock lock]; id object = [(sampler ? nx3_sampler_ids : nx3_texture_ids) objectForKey:@(value)]; [nx3_registry_lock unlock];
+    if (value && !object) { fprintf(stderr, "[RED] Metal3 unresolved %s resource ID 0x%llx\n", sampler ? "sampler" : "texture", (unsigned long long)value); abort(); }
     return object;
 }
 static id<MTLBuffer> nx3_buffer(uint64_t address, NSUInteger *offset) {
@@ -225,7 +229,7 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
         if ((table->textureMask[i / 64] & (1ull << (i % 64))) && (!pipelineBindings || (pipelineBindings->textures[stage][i / 64] & (1ull << (i % 64))))) {
             if ((validTextures[stage][i / 64] & (1ull << (i % 64))) && boundTextures[stage][i] == table->textures[i]) { atomic_fetch_add_explicit(&nx3_binding_skips, 1, memory_order_relaxed); }
             else {
-            id texture = nx3_id(table->textures[i]);
+            id texture = nx3_id(table->textures[i], NO);
             if (stage == 0) [enc setVertexTexture:texture atIndex:i]; else if (stage == 1) [enc setFragmentTexture:texture atIndex:i]; else if (stage == 3) [enc setObjectTexture:texture atIndex:i]; else if (stage == 4) [enc setMeshTexture:texture atIndex:i]; else [(id<MTLComputeCommandEncoder>)enc setTexture:texture atIndex:i];
             validTextures[stage][i / 64] |= 1ull << (i % 64); boundTextures[stage][i] = table->textures[i]; atomic_fetch_add_explicit(&nx3_binding_sets, 1, memory_order_relaxed);
             }
@@ -233,7 +237,7 @@ static void nx3_pipeline_save(id pipeline, NX3PipelineBindings *bindings) {
         if ((table->samplerMask[i / 64] & (1ull << (i % 64))) && (!pipelineBindings || (pipelineBindings->samplers[stage][i / 64] & (1ull << (i % 64))))) {
             if ((validSamplers[stage][i / 64] & (1ull << (i % 64))) && boundSamplers[stage][i] == table->samplers[i]) { atomic_fetch_add_explicit(&nx3_binding_skips, 1, memory_order_relaxed); }
             else {
-            id sampler = nx3_id(table->samplers[i]);
+            id sampler = nx3_id(table->samplers[i], YES);
             if (stage == 0) [enc setVertexSamplerState:sampler atIndex:i]; else if (stage == 1) [enc setFragmentSamplerState:sampler atIndex:i]; else if (stage == 3) [enc setObjectSamplerState:sampler atIndex:i]; else if (stage == 4) [enc setMeshSamplerState:sampler atIndex:i]; else [(id<MTLComputeCommandEncoder>)enc setSamplerState:sampler atIndex:i];
             validSamplers[stage][i / 64] |= 1ull << (i % 64); boundSamplers[stage][i] = table->samplers[i]; atomic_fetch_add_explicit(&nx3_binding_sets, 1, memory_order_relaxed);
             }
